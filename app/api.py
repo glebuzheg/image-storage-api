@@ -1,13 +1,15 @@
 import re
 from hashlib import sha256
 from hmac import compare_digest
-from typing import Annotated
+from typing import Annotated, Literal
+from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
+from pydantic import BaseModel
 from starlette.requests import ClientDisconnect
 
 from app.db import delete_image as delete_image_record
-from app.db import get_image, insert_image
+from app.db import get_image, get_thumbnail, get_upload_status, stage_upload
 from app.storage import MAX_IMAGE_BYTES, ImageTooLarge, InvalidImage, read_image
 
 IMAGE_NAME = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}\.(jpg|jpeg|png)")
@@ -22,6 +24,12 @@ async def require_key(request: Request) -> None:
 
 
 router = APIRouter(prefix="/images", dependencies=[Depends(require_key)])
+uploads_router = APIRouter(prefix="/uploads", dependencies=[Depends(require_key)])
+
+
+class UploadStatus(BaseModel):
+    status: Literal["pending", "stored"]
+    image_url: str
 
 
 async def check_name(name: str) -> str:
@@ -47,11 +55,11 @@ async def check_upload(name: ImageName, request: Request) -> str:
     return name
 
 
-@router.put("/{name}", status_code=201)
+@router.put("/{name}", status_code=202, response_class=Response)
 async def upload_image(
     name: Annotated[str, Depends(check_upload)], request: Request
 ) -> Response:
-    '''Подтверждаем загрузку после проверки и публикации файла.'''
+    '''Подтверждаем надёжный приём байтов и задания на запись.'''
     try:
         content = await read_image(name, request.stream())
     except ImageTooLarge:
@@ -61,9 +69,25 @@ async def upload_image(
     except ClientDisconnect:
         raise HTTPException(status_code=400, detail="Image upload interrupted") from None
 
-    if not await insert_image(request.app.state.db, name, content):
+    upload_id = await stage_upload(request.app.state.db, name, content)
+    if upload_id is None:
         raise HTTPException(status_code=409, detail="Image name already exists")
-    return Response(status_code=201, headers={"Location": f"/images/{name}"})
+    return Response(status_code=202, headers={"Location": f"/uploads/{upload_id}"})
+
+
+@uploads_router.get("/{upload_id}")
+async def upload_status(upload_id: UUID, request: Request, response: Response) -> UploadStatus:
+    '''Показываем, записан ли оригинал принятой загрузки.'''
+    result = await get_upload_status(request.app.state.db, upload_id)
+    if result is None:
+        raise HTTPException(
+            status_code=404, detail="Upload not found", headers={"Cache-Control": "no-store"}
+        )
+    name, stored = result
+    response.headers["Cache-Control"] = "no-store"
+    if not stored:
+        response.headers["Retry-After"] = "1"
+    return UploadStatus(status="stored" if stored else "pending", image_url=f"/images/{name}")
 
 
 @router.get("/{name}")
@@ -71,13 +95,34 @@ async def download_image(name: ImageName, request: Request) -> Response:
     '''Считываем байты из базы и отдаём их как вложение.'''
     content = await get_image(request.app.state.db, name)
     if content is None:
-        raise HTTPException(status_code=404, detail="Image not found")
+        raise HTTPException(
+            status_code=404, detail="Image not found", headers={"Cache-Control": "no-store"}
+        )
     media_type = "image/png" if name.endswith(".png") else "image/jpeg"
     return Response(
         content,
         media_type=media_type,
         headers={"Content-Disposition": f'attachment; filename="{name}"'},
     )
+
+
+@router.get(
+    "/{name}/thumbnail",
+    response_class=Response,
+    responses={200: {"content": {"image/png": {}}}},
+)
+async def download_thumbnail(name: ImageName, request: Request) -> Response:
+    '''Возвращаем готовый PNG или статус отсутствующей миниатюры.'''
+    headers = {"Cache-Control": "no-store"}
+    result = await get_thumbnail(request.app.state.db, name)
+    if result is not None:
+        thumbnail, pending = result
+        if thumbnail is not None:
+            return Response(thumbnail, media_type="image/png", headers=headers)
+        if pending:
+            headers["Retry-After"] = "1"
+            raise HTTPException(status_code=404, detail="Thumbnail pending", headers=headers)
+    raise HTTPException(status_code=404, detail="Thumbnail not found", headers=headers)
 
 
 @router.delete("/{name}", status_code=204)

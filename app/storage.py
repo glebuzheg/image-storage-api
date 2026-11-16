@@ -1,6 +1,7 @@
 import os
 import struct
 from collections.abc import AsyncIterator
+from io import BytesIO
 from tempfile import TemporaryFile
 from typing import BinaryIO
 
@@ -69,3 +70,26 @@ def _validate_and_read(temporary: BinaryIO, name: str) -> bytes:
 
     temporary.seek(0)
     return temporary.read()
+
+
+def render_thumbnail(content: bytes) -> bytes:
+    '''Уменьшаем первый кадр до PNG с максимальной стороной 256 пикселей.'''
+    try:
+        with BytesIO(content) as source, Image.open(source, formats=["JPEG", "PNG"]) as image:
+            if getattr(image, "is_animated", False) and image.info.get("default_image") is True:
+                image.seek(1)
+            image.load()
+            image.info.clear()
+            with image.convert("RGBA") as thumbnail, BytesIO() as output:
+                thumbnail.thumbnail((256, 256), Image.Resampling.LANCZOS)
+                thumbnail.save(output, format="PNG")
+                return output.getvalue()
+    except OSError as exc:
+        if exc.errno is not None:
+            raise
+        raise InvalidImage from exc
+    except (
+        Image.DecompressionBombError, EOFError, IndexError, SyntaxError, TypeError,
+        ValueError, struct.error,
+    ) as exc:
+        raise InvalidImage from exc

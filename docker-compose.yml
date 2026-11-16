@@ -12,6 +12,19 @@ services:
       interval: 2s
       timeout: 3s
       retries: 15
+  rabbitmq:
+    image: rabbitmq:4.3-alpine
+    hostname: rabbitmq
+    environment:
+      RABBITMQ_DEFAULT_USER: image_storage
+      RABBITMQ_DEFAULT_PASS: &rabbitmq_password ${RABBITMQ_PASSWORD:-local-dev-rabbitmq-password}
+    volumes:
+      - rabbitmq-data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "check_port_connectivity"]
+      interval: 3s
+      timeout: 5s
+      retries: 15
   api:
     build: .
     depends_on:
@@ -21,11 +34,25 @@ services:
       API_KEY_HASH: ${API_KEY_HASH:?Set API_KEY_HASH in .env}
       LEGACY_IMAGE_DIR: /legacy-images
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+      RABBITMQ_PASSWORD: *rabbitmq_password
     ports:
-      - "127.0.0.1:8000:8000"
+      - "127.0.0.1:${API_PORT:-8000}:8000"
     volumes:
       - images:/legacy-images:ro
+  worker:
+    build: .
+    command: ["/srv/.venv/bin/python", "-m", "app.worker"]
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+      RABBITMQ_PASSWORD: *rabbitmq_password
 
 volumes:
   postgres-data:
   images:
+  rabbitmq-data:

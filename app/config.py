@@ -1,5 +1,6 @@
 import os
 import re
+from urllib.parse import quote
 
 from sqlalchemy import URL, make_url
 
@@ -26,3 +27,11 @@ def load_settings() -> tuple[bytes, URL]:
     if not re.fullmatch(r"[0-9a-fA-F]{64}", key_hash):
         raise RuntimeError("API_KEY_HASH must be a 64-character SHA-256 hex digest")
     return bytes.fromhex(key_hash), database_url()
+
+
+def rabbitmq_url() -> str:
+    '''Читаем адрес RabbitMQ или собираем его для сети Compose.'''
+    if url := os.environ.get("RABBITMQ_URL"):
+        return url
+    password = quote(os.environ.get("RABBITMQ_PASSWORD", "local-dev-rabbitmq-password"), safe="")
+    return f"amqp://image_storage:{password}@rabbitmq:5672/"

@@ -2,15 +2,19 @@ import asyncio
 from hashlib import sha256
 from io import BytesIO
 from tempfile import TemporaryFile
+from uuid import UUID
 from zlib import crc32
 
 import httpx
 import pytest
 from PIL import Image, PngImagePlugin
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, func, select, update
 
+from app import worker
+from app.db import finalize_upload, mark_published, pending_events
 from app.main import app
 from app.models import StoredImage
+from app.storage import InvalidImage
 
 pytestmark = pytest.mark.anyio
 AUTH = {"X-API-Key": "test-key"}
@@ -30,6 +34,7 @@ async def client(monkeypatch, test_database_url):
     monkeypatch.delenv("API_KEY", raising=False)
     monkeypatch.setenv("API_KEY_HASH", TEST_KEY_HASH)
     monkeypatch.setenv("DATABASE_URL", test_database_url)
+    monkeypatch.setenv("RABBITMQ_URL", "amqp://127.0.0.1:1/")
     async with app.router.lifespan_context(app):
         async with app.state.db.begin() as connection:
             await connection.execute(delete(StoredImage))
@@ -37,6 +42,19 @@ async def client(monkeypatch, test_database_url):
             transport=httpx.ASGITransport(app=app), base_url="http://test"
         ) as client:
             yield client
+
+
+def accepted_id(response: httpx.Response) -> UUID:
+    '''Извлекаем идентификатор из адреса статуса принятой загрузки.'''
+    assert response.status_code == 202
+    return UUID(response.headers["location"].removeprefix("/uploads/"))
+
+
+async def store_accepted(response: httpx.Response) -> UUID:
+    '''Выполняем транзакцию воркера без транспорта RabbitMQ.'''
+    upload_id = accepted_id(response)
+    await finalize_upload(app.state.db, upload_id)
+    return upload_id
 
 
 async def image_count() -> int:
@@ -145,8 +163,23 @@ async def test_upload_download_delete(client, name, format, media_type):
     data = image_bytes(format)
     url = f"/images/{name}"
     created = await client.put(url, headers=AUTH, content=data)
-    assert created.status_code == 201
-    assert created.headers["location"] == url
+    assert created.status_code == 202
+
+    status_url = created.headers["location"]
+    assert status_url.startswith("/uploads/")
+    assert (await client.get(status_url)).status_code == 401
+    pending = await client.get(status_url, headers=AUTH)
+    assert pending.status_code == 200
+    assert pending.json() == {"status": "pending", "image_url": url}
+    assert pending.headers["retry-after"] == "1"
+    assert pending.headers["cache-control"] == "no-store"
+    assert (await client.get(url, headers=AUTH)).status_code == 404
+
+    await store_accepted(created)
+    stored = await client.get(status_url, headers=AUTH)
+    assert stored.status_code == 200
+    assert stored.json() == {"status": "stored", "image_url": url}
+    assert "retry-after" not in stored.headers
 
     downloaded = await client.get(url, headers=AUTH)
     assert downloaded.status_code == 200
@@ -157,6 +190,7 @@ async def test_upload_download_delete(client, name, format, media_type):
     deleted = await client.delete(url, headers=AUTH)
     assert deleted.status_code == 204
     assert deleted.content == b""
+    assert (await client.get(status_url, headers=AUTH)).status_code == 404
     assert (await client.get(url, headers=AUTH)).status_code == 404
     assert (await client.delete(url, headers=AUTH)).status_code == 404
 
@@ -177,8 +211,9 @@ async def test_simultaneous_uploads_preserve_one_file(client):
         *(client.put(url, headers=AUTH, content=body) for body in data)
     )
     codes = [response.status_code for response in responses]
-    assert sorted(codes) == [201, 409]
-    assert (await client.get(url, headers=AUTH)).content == data[codes.index(201)]
+    assert sorted(codes) == [202, 409]
+    await store_accepted(responses[codes.index(202)])
+    assert (await client.get(url, headers=AUTH)).content == data[codes.index(202)]
     assert await image_count() == 1
 
 
@@ -210,7 +245,7 @@ async def test_uploaded_image_may_take_exactly_ten_mib(client):
     data = image_bytes(pnginfo=pnginfo)
     assert len(data) == BYTE_LIMIT
     response = await client.put("/images/photo.png", headers=AUTH, content=data)
-    assert response.status_code == 201
+    assert response.status_code == 202
 
 
 @pytest.mark.parametrize(
@@ -306,7 +341,7 @@ async def test_valid_animation_round_trips(client):
     '''Проверяем, что допустимая анимация возвращается без изменения байтов.'''
     url = "/images/photo.png"
     data = animated_png()
-    assert (await client.put(url, headers=AUTH, content=data)).status_code == 201
+    await store_accepted(await client.put(url, headers=AUTH, content=data))
     assert (await client.get(url, headers=AUTH)).content == data
 
 
@@ -323,7 +358,7 @@ async def test_started_download_survives_delete(client):
     '''Проверяем выдачу считанных байтов после удаления строки.'''
     data = image_bytes()
     url = "/images/photo.png"
-    assert (await client.put(url, headers=AUTH, content=data)).status_code == 201
+    await store_accepted(await client.put(url, headers=AUTH, content=data))
     messages = []
 
     async def receive():
@@ -339,3 +374,172 @@ async def test_started_download_survives_delete(client):
     await app(image_scope(method="GET"), receive, send)
     assert messages[0]["status"] == 200
     assert b"".join(msg["body"] for msg in messages[1:]) == data
+
+
+async def test_thumbnail_http_contract(client):
+    '''Проверяем защиту, валидацию имени и статусы отсутствующей миниатюры.'''
+    url = "/images/photo.png"
+    thumbnail = f"{url}/thumbnail"
+    assert (await client.get(thumbnail)).status_code == 401
+    assert (await client.get("/images/PHOTO.png/thumbnail", headers=AUTH)).status_code == 400
+    missing = await client.get(thumbnail, headers=AUTH)
+    assert missing.status_code == 404
+    assert missing.headers["cache-control"] == "no-store"
+    assert "retry-after" not in missing.headers
+
+    async with app.state.db.begin() as connection:
+        await connection.execute(
+            StoredImage.__table__.insert().values(name="legacy.png", content=b"legacy bytes")
+        )
+    legacy = await client.get("/images/legacy.png/thumbnail", headers=AUTH)
+    assert legacy.status_code == 404 and "retry-after" not in legacy.headers
+    assert (await client.get("/images/legacy.png", headers=AUTH)).content == b"legacy bytes"
+
+    original = image_bytes(size=(640, 320))
+    created = await client.put(url, headers=AUTH, content=original)
+    assert created.status_code == 202
+    pending = await client.get(thumbnail, headers=AUTH)
+    assert pending.status_code == 404
+    assert pending.headers["retry-after"] == "1"
+    assert pending.headers["cache-control"] == "no-store"
+    await store_accepted(created)
+    assert (await client.get(url, headers=AUTH)).content == original
+
+
+@pytest.mark.parametrize(
+    ("name", "original", "expected_size"),
+    [
+        ("photo.jpg", image_bytes("JPEG", size=(640, 320)), (256, 128)),
+        ("photo.png", animated_png(size=(128, 64)), (128, 64)),
+    ],
+)
+async def test_worker_creates_thumbnail_once(client, name, original, expected_size):
+    '''Проверяем формат, размеры, повтор и удаление результата.'''
+    engine = app.state.db
+    url = f"/images/{name}"
+    upload_id = await store_accepted(await client.put(url, headers=AUTH, content=original))
+    assert (await client.put(url, headers=AUTH, content=original)).status_code == 409
+    await worker.process_thumbnail(engine, upload_id)
+
+    result = await client.get(f"{url}/thumbnail", headers=AUTH)
+    assert result.status_code == 200
+    assert result.headers["content-type"] == "image/png"
+    assert result.headers["cache-control"] == "no-store"
+    with Image.open(BytesIO(result.content)) as image:
+        assert image.format == "PNG"
+        assert image.size == expected_size
+        assert image.n_frames == 1
+
+    async with engine.begin() as connection:
+        await connection.execute(
+            update(StoredImage).where(StoredImage.upload_id == upload_id)
+            .values(thumbnail=b"previous result")
+        )
+    await worker.process_thumbnail(engine, upload_id)
+    assert (await client.get(f"{url}/thumbnail", headers=AUTH)).content == b"previous result"
+    assert (await client.get(url, headers=AUTH)).content == original
+    assert (await client.delete(url, headers=AUTH)).status_code == 204
+    assert await pending_events(engine) == []
+    assert (await client.get(f"{url}/thumbnail", headers=AUTH)).status_code == 404
+
+
+async def test_deleted_upload_cannot_write_to_reused_name(client, monkeypatch):
+    '''Удаляем оригинал между чтением и записью воркера и повторно занимаем имя.'''
+    engine = app.state.db
+    url = "/images/photo.png"
+    thumbnail = f"{url}/thumbnail"
+    old_id = await store_accepted(
+        await client.put(url, headers=AUTH, content=image_bytes(size=(640, 320)))
+    )
+    render_started = asyncio.Event()
+    resume_render = asyncio.Event()
+    run_sync = worker.run_sync
+
+    async def pause_render(func, content):
+        '''Приостанавливаем старое задание после чтения оригинала.'''
+        render_started.set()
+        await resume_render.wait()
+        return await run_sync(func, content)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(worker, "run_sync", pause_render)
+        async with asyncio.TaskGroup() as tasks:
+            tasks.create_task(worker.process_thumbnail(engine, old_id))
+            try:
+                await asyncio.wait_for(render_started.wait(), timeout=3)
+                assert (await client.delete(url, headers=AUTH)).status_code == 204
+                new_id = await store_accepted(await client.put(
+                    url, headers=AUTH, content=image_bytes(size=(320, 640))
+                ))
+                assert new_id != old_id
+            finally:
+                resume_render.set()
+
+    await worker.process_thumbnail(engine, old_id)
+    pending = await client.get(thumbnail, headers=AUTH)
+    assert pending.status_code == 404
+    assert pending.headers["retry-after"] == "1"
+    await worker.process_thumbnail(engine, new_id)
+    result = await client.get(thumbnail, headers=AUTH)
+    assert result.status_code == 200
+    with Image.open(BytesIO(result.content)) as image:
+        assert image.size == (128, 256)
+
+
+async def test_permanent_render_failure_ends_job(client, monkeypatch):
+    '''Завершаем задание при ошибке Pillow и оставляем оригинал доступным.'''
+    original = image_bytes()
+    url = "/images/photo.png"
+    created = await client.put(url, headers=AUTH, content=original)
+    upload_id = await store_accepted(created)
+
+    def invalid_image(_content):
+        '''Воспроизводим окончательную ошибку декодирования.'''
+        raise InvalidImage
+
+    monkeypatch.setattr(worker, "render_thumbnail", invalid_image)
+    await worker.process_thumbnail(app.state.db, upload_id)
+    assert await pending_events(app.state.db) == []
+    assert (await client.get(created.headers["location"], headers=AUTH)).json()["status"] == "stored"
+    response = await client.get(f"{url}/thumbnail", headers=AUTH)
+    assert response.status_code == 404 and "retry-after" not in response.headers
+    assert (await client.get(url, headers=AUTH)).content == original
+
+
+async def test_delayed_store_confirmation_preserves_thumbnail_event(client):
+    '''Подтверждаем оригинал после того, как воркер уже поставил миниатюру.'''
+    engine = app.state.db
+    url = "/images/photo.png"
+    original = image_bytes()
+    accepted = await client.put(url, headers=AUTH, content=original)
+    upload_id = accepted_id(accepted)
+    assert await pending_events(engine) == [(upload_id, True)]
+    assert (await client.put(url, headers=AUTH, content=original)).status_code == 409
+
+    await finalize_upload(engine, upload_id)
+    await mark_published(engine, upload_id, store_original=True)
+    assert await pending_events(engine) == [(upload_id, False)]
+
+    await mark_published(engine, upload_id, store_original=False)
+    await finalize_upload(engine, upload_id)
+    assert await pending_events(engine) == []
+    assert (await client.get(url, headers=AUTH)).content == original
+
+
+async def test_delete_cancels_original_and_old_event_cannot_store_reused_name(client):
+    '''Старый UUID остаётся недействительным после отмены и повторной загрузки.'''
+    url = "/images/photo.png"
+    accepted = await client.put(url, headers=AUTH, content=image_bytes())
+    old_id = accepted_id(accepted)
+    assert (await client.delete(url, headers=AUTH)).status_code == 204
+    assert (await client.get(accepted.headers["location"], headers=AUTH)).status_code == 404
+    assert await pending_events(app.state.db) == []
+
+    new_content = image_bytes(size=(320, 640))
+    replacement = await client.put(url, headers=AUTH, content=new_content)
+    new_id = accepted_id(replacement)
+    assert new_id != old_id
+    await finalize_upload(app.state.db, old_id)
+    assert (await client.get(url, headers=AUTH)).status_code == 404
+    await finalize_upload(app.state.db, new_id)
+    assert (await client.get(url, headers=AUTH)).content == new_content
