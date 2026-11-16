@@ -1,0 +1,20 @@
+[project]
+name = "image-storage-api"
+version = "0.1.0"
+requires-python = ">=3.13,<3.14"
+dependencies = [
+    "alembic>=1.14,<2",
+    "anyio>=4.9,<5",
+    "fastapi>=0.118,<1",
+    "pillow>=11.3,<14",
+    "psycopg[binary]>=3.2,<4",
+    "sqlalchemy[asyncio]>=2.0,<2.1",
+    "uvicorn>=0.34,<1",
+]
+
+[dependency-groups]
+dev = ["httpx>=0.28,<1", "pytest>=8,<10"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

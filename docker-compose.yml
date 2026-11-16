@@ -1,0 +1,31 @@
+services:
+  db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: image_storage
+      POSTGRES_DB: image_storage
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-h", "127.0.0.1", "-U", "image_storage", "-d", "image_storage"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+  api:
+    build: .
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      API_KEY_HASH: ${API_KEY_HASH:?Set API_KEY_HASH in .env}
+      LEGACY_IMAGE_DIR: /legacy-images
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+    ports:
+      - "127.0.0.1:8000:8000"
+    volumes:
+      - images:/legacy-images:ro
+
+volumes:
+  postgres-data:
+  images:
