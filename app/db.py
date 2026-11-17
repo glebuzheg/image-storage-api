@@ -7,6 +7,8 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 
 from app.models import StoredImage
 
+_thumbnail_unprocessed = StoredImage.thumbnail.is_(None) & ~StoredImage.thumbnail_failed
+
 
 async def stage_upload(engine: AsyncEngine, name: str, content: bytes) -> UUID | None:
     '''Резервируем имя, сохраняем принятые байты и создаём задание на запись.'''
@@ -96,8 +98,7 @@ async def get_thumbnail_source(engine: AsyncEngine, upload_id: UUID) -> bytes | 
         return await connection.scalar(
             select(StoredImage.content).where(
                 StoredImage.upload_id == upload_id,
-                StoredImage.thumbnail.is_(None),
-                ~StoredImage.thumbnail_failed,
+                _thumbnail_unprocessed,
             )
         )
 
@@ -114,8 +115,7 @@ async def save_thumbnail(engine: AsyncEngine, upload_id: UUID, thumbnail: bytes 
             .where(
                 StoredImage.upload_id == upload_id,
                 StoredImage.content.is_not(None),
-                StoredImage.thumbnail.is_(None),
-                ~StoredImage.thumbnail_failed,
+                _thumbnail_unprocessed,
             )
             .values(**result)
         )

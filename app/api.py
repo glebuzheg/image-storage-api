@@ -115,13 +115,12 @@ async def download_thumbnail(name: ImageName, request: Request) -> Response:
     '''Возвращаем готовый PNG или статус отсутствующей миниатюры.'''
     headers = {"Cache-Control": "no-store"}
     result = await get_thumbnail(request.app.state.db, name)
-    if result is not None:
-        thumbnail, pending = result
-        if thumbnail is not None:
-            return Response(thumbnail, media_type="image/png", headers=headers)
-        if pending:
-            headers["Retry-After"] = "1"
-            raise HTTPException(status_code=404, detail="Thumbnail pending", headers=headers)
+    thumbnail, pending = result if result is not None else (None, False)
+    if thumbnail is not None:
+        return Response(thumbnail, media_type="image/png", headers=headers)
+    if pending:
+        headers["Retry-After"] = "1"
+        raise HTTPException(status_code=404, detail="Thumbnail pending", headers=headers)
     raise HTTPException(status_code=404, detail="Thumbnail not found", headers=headers)
 
 

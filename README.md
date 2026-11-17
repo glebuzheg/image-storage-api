@@ -1,112 +1,55 @@
 # Image Storage API
 
-FastAPI-сервис хранит исходные байты JPEG и PNG в PostgreSQL. Изображения можно загрузить, скачать и удалить по имени. После загрузки воркер создаёт миниатюру, которую можно получить отдельным запросом.
+FastAPI-сервис для хранения JPEG и PNG в PostgreSQL. Воркер сохраняет оригиналы и создаёт миниатюры по заданиям из RabbitMQ.
 
 ## Запуск
 
-Нужен Docker с плагином Compose. Из корня проекта выполните:
+Из корня проекта с Docker Compose:
 
 ```sh
 cp .env.example .env
 docker compose up
 ```
 
-API доступен по адресу `http://127.0.0.1:8000`. В `.env` указывается `API_KEY_HASH` — SHA-256 от клиентского ключа в виде 64 шестнадцатеричных символов. Пример содержит хеш тестового ключа `local-dev-key`. Для доступа извне используйте уникальный случайный ключ и HTTPS.
+| Переменная | Назначение |
+| --- | --- |
+| `API_KEY_HASH` | SHA-256 ключа клиента в hex. В примере используется ключ `local-dev-key`. |
+| `POSTGRES_PASSWORD` | Пароль пользователя PostgreSQL `image_storage`. |
+| `RABBITMQ_PASSWORD` | Пароль пользователя RabbitMQ `image_storage`. |
+| `API_PORT` | Порт на `127.0.0.1`, по умолчанию `8000`. |
 
-### Собственный ключ
-
-Если установлен Python 3, сгенерируйте ключ и хеш:
-
-```sh
-python3 - <<'PY_KEY'
-from hashlib import sha256
-from secrets import token_urlsafe
-
-key = token_urlsafe(32)
-print(f"Ключ для клиента: {key}")
-print(f"API_KEY_HASH={sha256(key.encode()).hexdigest()}")
-PY_KEY
-```
-
-Сохраните исходный ключ у клиента для заголовка `X-API-Key`. Строкой `API_KEY_HASH=…` замените запись в серверном `.env`.
-
-Для перехода со старой конфигурации вычислите SHA-256 от точного значения прежнего ключа без завершающего перевода строки. Удалите запись `API_KEY` из `.env` и добавьте `API_KEY_HASH`. Клиенты продолжат использовать прежний ключ.
-
-### PostgreSQL, RabbitMQ и миграции
-
-`POSTGRES_PASSWORD` в `.env` задаёт пароль пользователя `image_storage`. Значение из примера подходит для локального запуска. Compose запускает PostgreSQL 17 во внутренней сети и ждёт готовности базы. Контейнер API выполняет `alembic upgrade head` при старте. Модель [StoredImage](app/models.py) содержит имя как первичный ключ и исходные байты в `bytea`.
-
-`RABBITMQ_PASSWORD` задаёт пароль внутреннего пользователя RabbitMQ `image_storage`. Для локального запуска Compose подставляет значение из примера по умолчанию. RabbitMQ и PostgreSQL доступны только во внутренней сети Compose. При запуске приложения вне Compose можно задать полный адрес брокера через `RABBITMQ_URL`. `API_PORT` задаёт внешний порт HTTP на `127.0.0.1`, по умолчанию 8000.
-
-Обновляясь с файловой версии, сохраните прежнее имя проекта Compose. Добавьте в существующий `.env` строку `POSTGRES_PASSWORD`, сохранив свой `API_KEY_HASH`, и выполните:
-
-```sh
-docker compose up -d --build
-```
-
-При первом запуске миграция переносит изображения из прежнего тома `images`, смонтированного только для чтения. Импорт выполняется онлайн и является необратимой миграцией. Для отката после переноса используйте резервную копию базы. PostgreSQL хранит данные в томе `postgres-data`. RabbitMQ хранит очереди в томе `rabbitmq-data`. Обычный `docker compose down` сохраняет тома. Команда `docker compose down -v` удаляет их вместе с данными.
-
-Миграция миниатюр сохраняет существующие оригиналы. Генерация включена для загрузок после миграции.
+Обычный `docker compose down` сохраняет данные PostgreSQL и очереди RabbitMQ. Для внешнего доступа задайте собственные ключ и пароли и используйте HTTPS.
 
 ## API
 
-Укажите исходный клиентский ключ в переменной `api_key`. В примере используется тестовый ключ `local-dev-key` и локальный файл `photo.png`.
+Все запросы требуют `X-API-Key`. Тело загрузки содержит байты JPEG или PNG. Имя соответствует `[a-z0-9][a-z0-9_-]{0,63}\.(jpg|jpeg|png)`. Лимиты — 10 МиБ и 25 млн пикселей суммарно по кадрам.
+
+| Запрос | Ответ |
+| --- | --- |
+| `PUT /images/{name}` | `202 Accepted`, в `Location` указан адрес статуса. |
+| `GET /uploads/{uuid}` | `200 OK` с `status` (`pending` или `stored`) и `image_url`. |
+| `GET /images/{name}` | `200 OK` с оригиналом после записи. |
+| `GET /images/{name}/thumbnail` | `200 OK` с PNG до 256 × 256. Пока миниатюра готовится, возвращает `404` с `Retry-After: 1`. |
+| `DELETE /images/{name}` | `204 No Content` после отмены загрузки или удаления оригинала и миниатюры. |
+
+Коды ошибок — `400` (имя или `Content-Length`), `401` (ключ), `404` (ресурс недоступен), `409` (имя занято), `413` (превышен лимит), `415` (недопустимый файл), `422` (некорректный UUID).
 
 ```sh
-api_key=local-dev-key
-url=http://127.0.0.1:8000/images/photo.png
+base=http://127.0.0.1:8000
+key=local-dev-key
+url="$base/images/photo.png"
 
-status_path=$(curl -fsS -D - -o /dev/null -H "X-API-Key: $api_key" --upload-file photo.png "$url" |
+status_path=$(curl -fsS -D - -o /dev/null -H "X-API-Key: $key" --upload-file photo.png "$url" |
   awk 'tolower($1) == "location:" { sub(/\r$/, "", $2); print $2 }')
-curl -i -H "X-API-Key: $api_key" "http://127.0.0.1:8000$status_path"
-# Дождитесь статуса stored, затем скачайте оригинал.
-curl -f -H "X-API-Key: $api_key" "$url" -o downloaded.png
-# Выполните после подготовки миниатюры. При 404 с Retry-After повторите запрос через секунду.
-curl -f -H "X-API-Key: $api_key" "$url/thumbnail" -o thumbnail.png
-curl -i -H "X-API-Key: $api_key" -X DELETE "$url"
+curl -fsS -H "X-API-Key: $key" "$base$status_path"
+# Дождитесь stored и готовности миниатюры.
+curl -f -H "X-API-Key: $key" "$url" -o downloaded.png
+curl -f -H "X-API-Key: $key" "$url/thumbnail" -o thumbnail.png
+curl -f -H "X-API-Key: $key" -X DELETE "$url"
 ```
 
-| Запрос | Успешный ответ |
-| --- | --- |
-| `PUT /images/{name}` | `202 Accepted` после надёжного приёма исходных байтов. `Location` содержит путь `/uploads/{uuid}`. |
-| `GET /uploads/{uuid}` | `200 OK` с полями `status` (`pending` или `stored`) и `image_url`. Для `pending` включён `Retry-After: 1`. |
-| `GET /images/{name}` | `200 OK` с исходными байтами как вложением и типом `image/png` или `image/jpeg`. |
-| `GET /images/{name}/thumbnail` | `200 OK` с готовой миниатюрой и типом `image/png`. |
-| `DELETE /images/{name}` | `204 No Content` после отмены принятой загрузки или удаления оригинала, миниатюры и заданий. |
+## Тесты
 
-| Код ошибки | Причина |
-| --- | --- |
-| `400` | Недопустимое имя или некорректный размер в заголовке. |
-| `401` | Ключ отсутствует или неверен. |
-| `404` | Оригинал или миниатюра пока недоступны, либо ресурс или UUID отсутствуют. |
-| `409` | Имя занято принятой загрузкой или сохранённым оригиналом. |
-| `413` | Тело больше 10 МиБ или изображение содержит больше 25 миллионов пикселей суммарно по кадрам. |
-| `415` | Файл пуст, повреждён или его формат отличается от расширения. |
-| `422` | Некорректный UUID в запросе статуса. |
+Задайте `TEST_DATABASE_URL` для тестового PostgreSQL и запустите `uv run --locked pytest` с Python 3.13. Тесты создают временную схему.
 
-Имя начинается с латинской строчной буквы или цифры. В основе имени допускаются до 64 символов из `a–z`, `0–9`, `_` и `-`. Расширение — `.jpg`, `.jpeg` или `.png`.
-
-Загрузка читается порциями во временный файл. Сервер отклоняет слишком большой `Content-Length` до чтения тела и отдельно проверяет фактически полученный размер. Допустимый файл становится доступен для скачивания после атомарного сохранения. Медленная передача может держать запрос открытым до завершения загрузки.
-
-Сервис резервирует имя и надёжно принимает байты даже при временно недоступном RabbitMQ. После `202` проверьте адрес из `Location`. Когда статус станет `stored`, оригинал доступен по `image_url`. Удаление делает прежний адрес статуса недоступным.
-
-Воркер сохраняет однокадровый PNG до 256 × 256 пикселей с сохранением пропорций. Маленькие изображения сохраняют размер, для APNG берётся первый кадр анимации, ориентация соответствует порядку пикселей оригинала. Пока задание выполняется, маршрут миниатюры возвращает `404` с `Retry-After: 1`. Для удалённых и сохранённых до миграции оригиналов, а также при окончательной ошибке декодирования маршрут возвращает `404` без `Retry-After`.
-
-## Тесты и спецификация
-
-Для тестов нужны uv, Python 3.13 и PostgreSQL. Пример с одноразовым контейнером:
-
-```sh
-docker run --rm -d --name image-storage-test-db -e POSTGRES_PASSWORD=test-password -p 127.0.0.1:55432:5432 postgres:17-alpine
-docker exec image-storage-test-db pg_isready -h 127.0.0.1 -U postgres
-TEST_DATABASE_URL=postgresql+psycopg://postgres:test-password@127.0.0.1:55432/postgres uv run --locked pytest
-docker stop image-storage-test-db
-```
-
-Запустите pytest после того, как `pg_isready` сообщит о готовности базы. Тесты применяют миграции в отдельной временной схеме.
-
-Архитектура, выбор технологий и ограничения описаны в [ARCHITECTURE.md](ARCHITECTURE.md). Текущий контракт загрузки описан в [OpenSpec для очереди оригиналов](openspec/specs/async-image-uploads/spec.md). См. также спецификации [хранения](openspec/specs/image-storage/spec.md) и [миниатюр](openspec/specs/image-thumbnails/spec.md) и [архив изменений](openspec/changes/archive/). Для проверки с установленным OpenSpec CLI выполните:
-
-```sh
-openspec validate --all --strict
-```
+[Архитектура](ARCHITECTURE.md) · [Спецификации OpenSpec](openspec/specs/)

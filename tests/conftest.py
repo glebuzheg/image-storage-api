@@ -37,18 +37,10 @@ def isolated_schema(base_url):
 
 
 @pytest.fixture(scope="session")
-def test_database_url(postgres_base_url, tmp_path_factory):
+def test_database_url(postgres_base_url):
     '''Подготавливаем проверенную миграциями таблицу для тестов маршрутов.'''
     with isolated_schema(postgres_base_url) as url:
         with pytest.MonkeyPatch.context() as patch:
             patch.setenv("DATABASE_URL", url)
-            patch.setenv("LEGACY_IMAGE_DIR", str(tmp_path_factory.mktemp("empty-legacy")))
             command.upgrade(Config("alembic.ini"), "head")
-        yield url
-
-
-@pytest.fixture
-def empty_database_url(postgres_base_url):
-    '''Даём тесту миграции отдельную пустую схему.'''
-    with isolated_schema(postgres_base_url) as url:
         yield url
